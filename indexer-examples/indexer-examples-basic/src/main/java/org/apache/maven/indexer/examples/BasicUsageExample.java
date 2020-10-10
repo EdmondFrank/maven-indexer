@@ -19,6 +19,11 @@ package org.apache.maven.indexer.examples;
  * under the License.
  */
 
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.FutureRequestExecutionMetrics;
+import org.apache.http.impl.client.HttpClients;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.MultiFields;
@@ -66,24 +71,54 @@ import org.eclipse.aether.util.version.GenericVersionScheme;
 import org.eclipse.aether.version.InvalidVersionSpecificationException;
 import org.eclipse.aether.version.Version;
 
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
+
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
+
+import java.io.InputStream;
+import java.util.*;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Collection of some use cases.
  */
 public class BasicUsageExample
 {
-    public static void main( String[] args )
-        throws Exception
-    {
+    public static void main( String[] args ) throws Exception {
         final BasicUsageExample basicUsageExample = new BasicUsageExample();
-        basicUsageExample.perform();
+        CommandLine line = parseArguments(args);
+        if (line.hasOption("cache-dir") && line.hasOption("index-dir")) {
+            String cacheDir = line.getOptionValue("cache-dir");
+            String indexDir = line.getOptionValue("index-dir");
+            String indexUrl = "https://repo1.maven.org/maven2";
+            String nexusUrl = "http://mirrors.gitee.com/repository/maven-public";
+            if (line.hasOption("index-url")) {
+                indexUrl = line.getOptionValue("index-url");
+            }
+            if (line.hasOption("nexus-url")) {
+                nexusUrl = line.getOptionValue("nexus-url");
+            }
+            boolean onlyStat = line.hasOption("stat");
+            HashMap<String, String> options = new HashMap<String, String>();
+            options.put("cache-dir", cacheDir);
+            options.put("index-dir", indexDir);
+            options.put("index-url", indexUrl);
+            options.put("nexus-url", nexusUrl);
+            options.put("only-stat", line.hasOption("stat") ? "1" : "0");
+            basicUsageExample.perform(options);
+        } else {
+            printHelp();
+        }
     }
 
     // ==
@@ -118,30 +153,31 @@ public class BasicUsageExample
 
     }
 
-    public void perform()
-        throws IOException, ComponentLookupException, InvalidVersionSpecificationException
-    {
+    public void perform(HashMap<String, String> options)
+            throws IOException, ComponentLookupException, InvalidVersionSpecificationException, InterruptedException {
         // Files where local cache is (if any) and Lucene Index should be located
-        File centralLocalCache = new File( "target/central-cache" );
-        File centralIndexDir = new File( "target/central-index" );
+        // String cacheDir, String indexDir, String indexUrl, String nexusUrl
+        File centralLocalCache = new File(options.get("cache-dir"));
+        File centralIndexDir = new File(options.get("index-dir"));
 
         // Creators we want to use (search for fields it defines)
         List<IndexCreator> indexers = new ArrayList<>();
-        indexers.add( plexusContainer.lookup( IndexCreator.class, "min" ) );
-        indexers.add( plexusContainer.lookup( IndexCreator.class, "jarContent" ) );
-        indexers.add( plexusContainer.lookup( IndexCreator.class, "maven-plugin" ) );
+        indexers.add(plexusContainer.lookup( IndexCreator.class, "min" ));
+        indexers.add(plexusContainer.lookup( IndexCreator.class, "jarContent" ));
+        indexers.add(plexusContainer.lookup( IndexCreator.class, "maven-plugin" ));
 
         // Create context for central repository index
-        centralContext =
-            indexer.createIndexingContext( "central-context", "central", centralLocalCache, centralIndexDir,
-                                           "https://repo1.maven.org/maven2", null, true, true, indexers );
+        centralContext = indexer.createIndexingContext(
+                "central-context", "central",
+                centralLocalCache, centralIndexDir,
+                options.get("index-url"), null, true, true, indexers );
 
         // Update the index (incremental update will happen if this is not 1st run and files are not deleted)
         // This whole block below should not be executed on every app start, but rather controlled by some configuration
         // since this block will always emit at least one HTTP GET. Central indexes are updated once a week, but
         // other index sources might have different index publishing frequency.
         // Preferred frequency is once a week.
-        if ( true )
+        if ( false )
         {
             System.out.println( "Updating Index..." );
             System.out.println( "This might take a while on first run, so please be patient!" );
@@ -192,140 +228,191 @@ public class BasicUsageExample
         System.out.println();
 
         // ====
+
+
         // Case:
         // dump all the GAVs
         // NOTE: will not actually execute do this below, is too long to do (Central is HUGE), but is here as code
         // example
-        if ( false )
+        if (options.get("only-stat") != "1")
         {
             final IndexSearcher searcher = centralContext.acquireIndexSearcher();
+            final ExecutorService executorService = Executors.newFixedThreadPool(8);
             try
             {
                 final IndexReader ir = searcher.getIndexReader();
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
+                int batchSize = 50;
+                List<Future> futures = new ArrayList<Future>();
                 for ( int i = 0; i < ir.maxDoc(); i++ )
                 {
                     if ( liveDocs == null || liveDocs.get( i ) )
                     {
                         final Document doc = ir.document( i );
                         final ArtifactInfo ai = IndexUtils.constructArtifactInfo( doc, centralContext );
-                        System.out.println( ai.getGroupId() + ":" + ai.getArtifactId() + ":" + ai.getVersion() + ":"
-                                                + ai.getClassifier() + " (sha1=" + ai.getSha1() + ")" );
+                        futures.add(executorService.submit(() -> {
+                            try {
+                                String artifactUrl = options.get("nexus-url")
+                                        + '/' + ai.getGroupId().replace('.','/')
+                                        + '/' + ai.getArtifactId()
+                                        + '/' + ai.getVersion()
+                                        + '/' + ai.getArtifactId()
+                                        + '-' + ai.getVersion()
+                                        + '.' + ai.getFileExtension();
+                                downloadFile(artifactUrl);
+                            } catch (Exception e) {
+                                System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
+                            }
+                        }));
+                        if( batchSize-- < 0) {
+                           for(Future f: futures) {
+                               try {
+                                   f.get();
+                               } catch (Exception e) {
+                                   System.out.println("failed get result from future: " + e.toString());
+                               }
+                           }
+                           futures.clear();
+                           batchSize = 50;
+                        }
+
+//                        System.out.println(ai.getGroupId() + ":" + ai.getArtifactId() + ":" + ai.getVersion() + ":"
+//                                                + ai.getClassifier() + " (sha1=" + ai.getSha1() + ")" );
+                    }
+
+                }
+            } finally {
+                centralContext.releaseIndexSearcher(searcher);
+                executorService.shutdown();
+                executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
+            }
+        } else {
+            final IndexSearcher searcher = centralContext.acquireIndexSearcher();
+            long totalSize = 0;
+            try {
+                final IndexReader ir = searcher.getIndexReader();
+                Bits liveDocs = MultiFields.getLiveDocs( ir );
+                for ( int i = 0; i < ir.maxDoc(); i++ ) {
+                    if ( liveDocs == null || liveDocs.get(i) ) {
+                        final Document doc = ir.document(i);
+                        final ArtifactInfo ai = IndexUtils.constructArtifactInfo(doc, centralContext);
+                        if(ai != null) {
+                            totalSize += ai.getSize();
+                        }
                     }
                 }
-            }
-            finally
-            {
-                centralContext.releaseIndexSearcher( searcher );
+                System.out.println(sizeFmt(totalSize));
+            } finally {
+                centralContext.releaseIndexSearcher(searcher);
             }
         }
 
         // ====
         // Case:
         // Search for all GAVs with known G and A and having version greater than V
-
-        final GenericVersionScheme versionScheme = new GenericVersionScheme();
-        final String versionString = "1.5.0";
-        final Version version = versionScheme.parseVersion( versionString );
-
-        // construct the query for known GA
-        final Query groupIdQ =
-            indexer.constructQuery( MAVEN.GROUP_ID, new SourcedSearchExpression( "org.sonatype.nexus" ) );
-        final Query artifactIdQ =
-            indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression( "nexus-api" ) );
-
-        final BooleanQuery query = new BooleanQuery.Builder()
-            .add( groupIdQ, Occur.MUST )
-            .add( artifactIdQ, Occur.MUST )
-            // we want "jar" artifacts only
-            .add( indexer.constructQuery( MAVEN.PACKAGING, new SourcedSearchExpression( "jar" ) ), Occur.MUST )
-            // we want main artifacts only (no classifier)
-            // Note: this below is unfinished API, needs fixing
-            .add( indexer.constructQuery( MAVEN.CLASSIFIER,
-                    new SourcedSearchExpression( Field.NOT_PRESENT ) ), Occur.MUST_NOT )
-            .build();
-
-        // construct the filter to express "V greater than"
-        final ArtifactInfoFilter versionFilter = new ArtifactInfoFilter()
-        {
-            public boolean accepts( final IndexingContext ctx, final ArtifactInfo ai )
-            {
-                try
-                {
-                    final Version aiV = versionScheme.parseVersion( ai.getVersion() );
-                    // Use ">=" if you are INCLUSIVE
-                    return aiV.compareTo( version ) > 0;
-                }
-                catch ( InvalidVersionSpecificationException e )
-                {
-                    // do something here? be safe and include?
-                    return true;
-                }
-            }
-        };
-
-        System.out.println(
-            "Searching for all GAVs with G=org.sonatype.nexus and nexus-api and having V greater than 1.5.0" );
-        final IteratorSearchRequest request =
-            new IteratorSearchRequest( query, Collections.singletonList( centralContext ), versionFilter );
-        final IteratorSearchResponse response = indexer.searchIterator( request );
-        for ( ArtifactInfo ai : response )
-        {
-            System.out.println( ai.toString() );
-        }
-
-        // Case:
-        // Use index
-        // Searching for some artifact
-        Query gidQ =
-            indexer.constructQuery( MAVEN.GROUP_ID, new SourcedSearchExpression( "org.apache.maven.indexer" ) );
-        Query aidQ = indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression( "indexer-artifact" ) );
-
-        BooleanQuery bq = new BooleanQuery.Builder()
-                .add( gidQ, Occur.MUST )
-                .add( aidQ, Occur.MUST )
-                .build();
-
-        searchAndDump( indexer, "all artifacts under GA org.apache.maven.indexer:indexer-artifact", bq );
-
-        // Searching for some main artifact
-        bq = new BooleanQuery.Builder()
-                .add( gidQ, Occur.MUST )
-                .add( aidQ, Occur.MUST )
-//                .add( indexer.constructQuery( MAVEN.CLASSIFIER, new SourcedSearchExpression( "*" ) ), Occur.MUST_NOT )
-                .build();
-
-        searchAndDump( indexer, "main artifacts under GA org.apache.maven.indexer:indexer-artifact", bq );
-
-        // doing sha1 search
-        searchAndDump( indexer, "SHA1 7ab67e6b20e5332a7fb4fdf2f019aec4275846c2",
-                       indexer.constructQuery( MAVEN.SHA1,
-                                               new SourcedSearchExpression( "7ab67e6b20e5332a7fb4fdf2f019aec4275846c2" )
-                       )
-        );
-
-        searchAndDump( indexer, "SHA1 7ab67e6b20 (partial hash)",
-                       indexer.constructQuery( MAVEN.SHA1, new UserInputSearchExpression( "7ab67e6b20" ) ) );
-
-        // doing classname search (incomplete classname)
-        searchAndDump( indexer, "classname DefaultNexusIndexer (note: Central does not publish classes in the index)",
-                       indexer.constructQuery( MAVEN.CLASSNAMES,
-                                               new UserInputSearchExpression( "DefaultNexusIndexer" ) ) );
-
-        // doing search for all "canonical" maven plugins latest versions
-        bq = new BooleanQuery.Builder()
-            .add( indexer.constructQuery( MAVEN.PACKAGING, new SourcedSearchExpression( "maven-plugin" ) ), Occur.MUST )
-            .add( indexer.constructQuery( MAVEN.GROUP_ID,
-                    new SourcedSearchExpression( "org.apache.maven.plugins" ) ), Occur.MUST )
-            .build();
-
-        searchGroupedAndDump( indexer, "all \"canonical\" maven plugins", bq, new GAGrouping() );
-
-        // doing search for all archetypes latest versions
-        searchGroupedAndDump( indexer, "all maven archetypes (latest versions)",
-                              indexer.constructQuery( MAVEN.PACKAGING,
-                                                      new SourcedSearchExpression( "maven-archetype" ) ),
-                              new GAGrouping() );
+//
+//        final GenericVersionScheme versionScheme = new GenericVersionScheme();
+//        final String versionString = "1.5.0";
+//        final Version version = versionScheme.parseVersion( versionString );
+//
+//        // construct the query for known GA
+//        final Query groupIdQ =
+//            indexer.constructQuery( MAVEN.GROUP_ID, new SourcedSearchExpression( "org.sonatype.nexus" ) );
+//        final Query artifactIdQ =
+//            indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression( "nexus-api" ) );
+//
+//        final BooleanQuery query = new BooleanQuery.Builder()
+//            .add( groupIdQ, Occur.MUST )
+//            .add( artifactIdQ, Occur.MUST )
+//            // we want "jar" artifacts only
+//            .add( indexer.constructQuery( MAVEN.PACKAGING, new SourcedSearchExpression( "jar" ) ), Occur.MUST )
+//            // we want main artifacts only (no classifier)
+//            // Note: this below is unfinished API, needs fixing
+//            .add( indexer.constructQuery( MAVEN.CLASSIFIER,
+//                    new SourcedSearchExpression( Field.NOT_PRESENT ) ), Occur.MUST_NOT )
+//            .build();
+//
+//        // construct the filter to express "V greater than"
+//        final ArtifactInfoFilter versionFilter = new ArtifactInfoFilter()
+//        {
+//            public boolean accepts( final IndexingContext ctx, final ArtifactInfo ai )
+//            {
+//                try
+//                {
+//                    final Version aiV = versionScheme.parseVersion( ai.getVersion() );
+//                    // Use ">=" if you are INCLUSIVE
+//                    return aiV.compareTo( version ) > 0;
+//                }
+//                catch ( InvalidVersionSpecificationException e )
+//                {
+//                    // do something here? be safe and include?
+//                    return true;
+//                }
+//            }
+//        };
+//
+//        System.out.println(
+//            "Searching for all GAVs with G=org.sonatype.nexus and nexus-api and having V greater than 1.5.0" );
+//        final IteratorSearchRequest request =
+//            new IteratorSearchRequest( query, Collections.singletonList( centralContext ), versionFilter );
+//        final IteratorSearchResponse response = indexer.searchIterator( request );
+//        for ( ArtifactInfo ai : response )
+//        {
+//            System.out.println( ai.toString() );
+//        }
+//
+//        // Case:
+//        // Use index
+//        // Searching for some artifact
+//        Query gidQ =
+//            indexer.constructQuery( MAVEN.GROUP_ID, new SourcedSearchExpression( "org.apache.maven.indexer" ) );
+//        Query aidQ = indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression( "indexer-artifact" ) );
+//
+//        BooleanQuery bq = new BooleanQuery.Builder()
+//                .add( gidQ, Occur.MUST )
+//                .add( aidQ, Occur.MUST )
+//                .build();
+//
+//        searchAndDump( indexer, "all artifacts under GA org.apache.maven.indexer:indexer-artifact", bq );
+//
+//        // Searching for some main artifact
+//        bq = new BooleanQuery.Builder()
+//                .add( gidQ, Occur.MUST )
+//                .add( aidQ, Occur.MUST )
+////                .add( indexer.constructQuery( MAVEN.CLASSIFIER, new SourcedSearchExpression( "*" ) ), Occur.MUST_NOT )
+//                .build();
+//
+//        searchAndDump( indexer, "main artifacts under GA org.apache.maven.indexer:indexer-artifact", bq );
+//
+//        // doing sha1 search
+//        searchAndDump( indexer, "SHA1 7ab67e6b20e5332a7fb4fdf2f019aec4275846c2",
+//                       indexer.constructQuery( MAVEN.SHA1,
+//                                               new SourcedSearchExpression( "7ab67e6b20e5332a7fb4fdf2f019aec4275846c2" )
+//                       )
+//        );
+//
+//        searchAndDump( indexer, "SHA1 7ab67e6b20 (partial hash)",
+//                       indexer.constructQuery( MAVEN.SHA1, new UserInputSearchExpression( "7ab67e6b20" ) ) );
+//
+//        // doing classname search (incomplete classname)
+//        searchAndDump( indexer, "classname DefaultNexusIndexer (note: Central does not publish classes in the index)",
+//                       indexer.constructQuery( MAVEN.CLASSNAMES,
+//                                               new UserInputSearchExpression( "DefaultNexusIndexer" ) ) );
+//
+//        // doing search for all "canonical" maven plugins latest versions
+//        bq = new BooleanQuery.Builder()
+//            .add( indexer.constructQuery( MAVEN.PACKAGING, new SourcedSearchExpression( "maven-plugin" ) ), Occur.MUST )
+//            .add( indexer.constructQuery( MAVEN.GROUP_ID,
+//                    new SourcedSearchExpression( "org.apache.maven.plugins" ) ), Occur.MUST )
+//            .build();
+//
+//        searchGroupedAndDump( indexer, "all \"canonical\" maven plugins", bq, new GAGrouping() );
+//
+//        // doing search for all archetypes latest versions
+//        searchGroupedAndDump( indexer, "all maven archetypes (latest versions)",
+//                              indexer.constructQuery( MAVEN.PACKAGING,
+//                                                      new SourcedSearchExpression( "maven-archetype" ) ),
+//                              new GAGrouping() );
 
         // close cleanly
         indexer.closeIndexingContext( centralContext, false );
@@ -371,5 +458,68 @@ public class BasicUsageExample
         System.out.println( "------" );
         System.out.println( "Total record hits: " + response.getTotalHitsCount() );
         System.out.println();
+    }
+
+    private static Options getOptions() {
+        Options options = new Options();
+        options.addOption("c","cache-dir", true, "the path to local central cache dir");
+        options.addOption("i", "index-dir", true, "the path to local lucene dir");
+        options.addOption("r", "index-url", true, "the parent url of remote central index" );
+        options.addOption("n","nexus-url", true, "the repository url of nexus");
+        options.addOption("s", "stat", false, "only get artifacts statistics information");
+        return options;
+    }
+
+    private static void downloadFile(String uri) throws Exception {
+        CloseableHttpClient httpclient = HttpClients.createDefault();
+        HttpGet httpGet = new HttpGet(uri);
+        CloseableHttpResponse response = null;
+        try {
+            response = httpclient.execute(httpGet);
+            if(response.getStatusLine().getStatusCode() == 200) {
+                System.out.println("downloaded " + uri + " successfully!");
+            } else {
+                System.out.println("failed to downloaded " + uri);
+            }
+        } finally {
+            if (response != null) {
+                response.close();
+            }
+            httpclient.close();
+        }
+    }
+    private static String sizeFmt(long num) {
+        return sizeFmt(num, "iB");
+    }
+    private static String sizeFmt(long dnum, String suffix) {
+        String[] units = {"", "K", "M", "G", "T", "P", "E", "Z"};
+        double num = (double) dnum;
+        for (String unit : units) {
+            if (Math.abs(num) < 1024) {
+                return String.format("%,.2f%s%s", num, unit, suffix);
+            }
+            num /= 1024.0;
+        }
+        return String.format("%,.2f%s%s", num, 'Y', suffix);
+    }
+    private static void printHelp() {
+        Options options = getOptions();
+        HelpFormatter formatter = new HelpFormatter();
+        formatter.printHelp("Run with java -jar:", options, true);
+    }
+
+    private static CommandLine parseArguments(String[] args) {
+        Options options = getOptions();
+        CommandLine line = null;
+        CommandLineParser parser = new DefaultParser();
+        try {
+            line = parser.parse(options, args);
+        } catch (ParseException ex) {
+            System.err.println("Failed to parse command line arguments");
+            System.err.println(ex.toString());
+            printHelp();
+            System.exit(1);
+        }
+        return line;
     }
 }
