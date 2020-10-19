@@ -237,7 +237,7 @@ public class BasicUsageExample
         if (options.get("only-stat") != "1")
         {
             final IndexSearcher searcher = centralContext.acquireIndexSearcher();
-            final ExecutorService executorService = Executors.newFixedThreadPool(8);
+            final ExecutorService executorService = Executors.newFixedThreadPool(16);
             try
             {
                 final IndexReader ir = searcher.getIndexReader();
@@ -291,6 +291,7 @@ public class BasicUsageExample
             long totalSize = 0;
             try {
                 final IndexReader ir = searcher.getIndexReader();
+                System.out.println(ir.maxDoc());
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
                 for ( int i = 0; i < ir.maxDoc(); i++ ) {
                     if ( liveDocs == null || liveDocs.get(i) ) {
