@@ -242,7 +242,7 @@ public class BasicUsageExample
             {
                 final IndexReader ir = searcher.getIndexReader();
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
-                int batchSize = 50;
+                int batchSize = 2000;
                 List<Future> futures = new ArrayList<Future>();
                 for ( int i = 0; i < ir.maxDoc(); i++ )
                 {
@@ -273,13 +273,23 @@ public class BasicUsageExample
                                }
                            }
                            futures.clear();
-                           batchSize = 50;
+                           batchSize = 2000;
                         }
 
 //                        System.out.println(ai.getGroupId() + ":" + ai.getArtifactId() + ":" + ai.getVersion() + ":"
 //                                                + ai.getClassifier() + " (sha1=" + ai.getSha1() + ")" );
                     }
 
+                }
+                if (!futures.isEmpty()) {
+                    for(Future f: futures) {
+                        try {
+                            f.get();
+                        } catch (Exception e) {
+                            System.out.println("failed get result from future: " + e.toString());
+                        }
+                    }
+                    futures.clear();
                 }
             } finally {
                 centralContext.releaseIndexSearcher(searcher);
