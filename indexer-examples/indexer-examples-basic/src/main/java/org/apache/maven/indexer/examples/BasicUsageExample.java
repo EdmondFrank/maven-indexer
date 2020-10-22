@@ -60,6 +60,7 @@ import org.apache.maven.wagon.Wagon;
 import org.apache.maven.wagon.events.TransferEvent;
 import org.apache.maven.wagon.events.TransferListener;
 import org.apache.maven.wagon.observers.AbstractTransferListener;
+import org.apache.maven.wagon.proxy.ProxyInfo;
 import org.codehaus.plexus.DefaultContainerConfiguration;
 import org.codehaus.plexus.DefaultPlexusContainer;
 import org.codehaus.plexus.PlexusConstants;
@@ -177,7 +178,7 @@ public class BasicUsageExample
         // since this block will always emit at least one HTTP GET. Central indexes are updated once a week, but
         // other index sources might have different index publishing frequency.
         // Preferred frequency is once a week.
-        if ( false )
+        if ( true )
         {
             System.out.println( "Updating Index..." );
             System.out.println( "This might take a while on first run, so please be patient!" );
@@ -185,13 +186,38 @@ public class BasicUsageExample
             // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
             TransferListener listener = new AbstractTransferListener()
             {
+                private int count = 0;
+                private int unitChunk = 64;
+                private int col = 0;
+                private int kb = 0;
                 public void transferStarted( TransferEvent transferEvent )
                 {
-                    System.out.print( "  Downloading " + transferEvent.getResource().getName() );
+                    System.out.println( "  Downloading " + transferEvent.getResource().getName() );
                 }
 
                 public void transferProgress( TransferEvent transferEvent, byte[] buffer, int length )
                 {
+                    long totalLength = transferEvent.getResource().getContentLength();
+                    if ( buffer == null )
+                    {
+                        return;
+                    }
+
+
+                    count += buffer.length;
+
+                    if ( ( count / unitChunk ) > kb )
+                    {
+                        if ( col > 80 )
+                        {
+                            System.out.println(String.format("%s/%s", sizeFmt(count), sizeFmt(totalLength)));
+                            col = 0;
+                        }
+
+                        System.out.print( '.' );
+                        col++;
+                        kb++;
+                    }
                 }
 
                 public void transferCompleted( TransferEvent transferEvent )
@@ -199,7 +225,13 @@ public class BasicUsageExample
                     System.out.println( " - Done" );
                 }
             };
-            ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher( httpWagon, listener, null, null );
+
+            ProxyInfo proxy = new ProxyInfo();
+            proxy.setHost("127.0.0.1");
+            proxy.setPort(1081);
+            proxy.setType("HTTP");
+
+            ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher( httpWagon, listener, null, proxy );
 
             Date centralContextCurrentTimestamp = centralContext.getTimestamp();
             IndexUpdateRequest updateRequest = new IndexUpdateRequest( centralContext, resourceFetcher );
@@ -275,11 +307,7 @@ public class BasicUsageExample
                            futures.clear();
                            batchSize = 2000;
                         }
-
-//                        System.out.println(ai.getGroupId() + ":" + ai.getArtifactId() + ":" + ai.getVersion() + ":"
-//                                                + ai.getClassifier() + " (sha1=" + ai.getSha1() + ")" );
                     }
-
                 }
                 if (!futures.isEmpty()) {
                     for(Future f: futures) {
