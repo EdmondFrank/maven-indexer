@@ -44,13 +44,25 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.TimeZone;
 
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.client.methods.CloseableHttpResponse;
+
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.MultiFields;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
+import org.apache.maven.index.ArtifactInfo;
 import org.apache.maven.index.context.DocumentFilter;
 import org.apache.maven.index.context.IndexUtils;
 import org.apache.maven.index.context.IndexingContext;
@@ -87,6 +99,8 @@ public class DefaultIndexUpdater
     private final IncrementalHandler incrementalHandler;
 
     private final List<IndexUpdateSideEffect> sideEffects;
+
+    private static String nexusHost = "http://mirrors.gitee.com/repository/maven-public";
 
 
     @Inject
@@ -223,6 +237,11 @@ public class DefaultIndexUpdater
             if ( merge )
             {
                 updateRequest.getIndexingContext().merge( directory );
+                try {
+                    syncBlobFileByIndexDir(updateRequest, directory, null);
+                } catch (InterruptedException e) {
+                    getLogger().error( "Artifact incremental sync blobs error", e );
+                }
             }
             else
             {
@@ -250,6 +269,79 @@ public class DefaultIndexUpdater
                 // ignore
             }
         }
+    }
+
+    private static void downloadFile(String uri) throws Exception {
+        CloseableHttpClient httpclient = HttpClients.createDefault();
+        HttpGet httpGet = new HttpGet(uri);
+        CloseableHttpResponse response = null;
+        try {
+            response = httpclient.execute(httpGet);
+            if(response.getStatusLine().getStatusCode() == 200) {
+                System.out.println("downloaded " + uri + " successfully!");
+            } else {
+                System.out.println("failed to downloaded " + uri);
+            }
+        } finally {
+            if (response != null) {
+                response.close();
+            }
+            httpclient.close();
+        }
+    }
+
+    private static void syncBlobFileByIndexDir(final IndexUpdateRequest updateRequest,
+                                        Directory directory,
+                                        final DocumentFilter filter) throws IOException, InterruptedException {
+        IndexingContext centralContext = updateRequest.getIndexingContext();
+        final IndexSearcher s = centralContext.acquireIndexSearcher();
+        try {
+            final IndexReader directoryReader = DirectoryReader.open(directory);
+            final int workers = 8;
+            final ThreadPoolExecutor executorService = new ThreadPoolExecutor(
+                                                                              workers,
+                                                                              workers,
+                                                                              0L,
+                                                                              TimeUnit.MILLISECONDS,
+                                                                              new ArrayBlockingQueue<Runnable>(workers),
+                                                                              new ThreadPoolExecutor.CallerRunsPolicy());
+            try {
+                Bits liveDocs = MultiFields.getLiveDocs(directoryReader);
+                System.out.println("This updated docs nums:" + directoryReader.maxDoc());
+                for (int i = 0; i < directoryReader.maxDoc(); i++) {
+                    if ( liveDocs == null || liveDocs.get( i ) ) {
+                        final Document doc = directoryReader.document( i );
+                        final ArtifactInfo ai = IndexUtils.constructArtifactInfo( doc, centralContext );
+                        executorService.submit(new Callable<Boolean>() {
+                            @Override
+                            public Boolean call() throws Exception {
+                                try {
+                                    String artifactUrl = nexusHost
+                                            + '/' + ai.getGroupId().replace('.','/')
+                                            + '/' + ai.getArtifactId()
+                                            + '/' + ai.getVersion()
+                                            + '/' + ai.getArtifactId()
+                                            + '-' + ai.getVersion()
+                                            + '.' + ai.getFileExtension();
+                                    downloadFile(artifactUrl);
+                                    return true;
+                                } catch (Exception e) {
+                                    System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
+                                    return false;
+                                }
+                            }
+                        });
+                    }
+                }
+            } finally {
+                directoryReader.close();
+                executorService.shutdown();
+                executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
+            }
+        } finally {
+            centralContext.releaseIndexSearcher(s);
+        }
+
     }
 
     private static void filterDirectory( final Directory directory, final DocumentFilter filter )
@@ -672,6 +764,7 @@ public class DefaultIndexUpdater
         
         if ( !updateRequest.isForceFullUpdate() )
         {
+            getLogger().info("Incremental Updated");
             Properties localProperties = target.getProperties();
             Date localTimestamp = null;
 
@@ -734,6 +827,7 @@ public class DefaultIndexUpdater
 
         if ( !updateRequest.isIncrementalOnly() )
         {
+            getLogger().info("Full Updated");
             Date timestamp = null;
             try
             {

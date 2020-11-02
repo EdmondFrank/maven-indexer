@@ -85,6 +85,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.*;
 
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -178,38 +180,29 @@ public class BasicUsageExample
         // since this block will always emit at least one HTTP GET. Central indexes are updated once a week, but
         // other index sources might have different index publishing frequency.
         // Preferred frequency is once a week.
-        if ( true )
-        {
-            System.out.println( "Updating Index..." );
-            System.out.println( "This might take a while on first run, so please be patient!" );
-            // Create ResourceFetcher implementation to be used with IndexUpdateRequest
-            // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
-            TransferListener listener = new AbstractTransferListener()
-            {
+
+        System.out.println( "Updating Index..." );
+        System.out.println( "This might take a while on first run, so please be patient!" );
+        // Create ResourceFetcher implementation to be used with IndexUpdateRequest
+        // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
+        TransferListener listener = new AbstractTransferListener() {
                 private int count = 0;
                 private int unitChunk = 64;
                 private int col = 0;
                 private int kb = 0;
-                public void transferStarted( TransferEvent transferEvent )
-                {
+                public void transferStarted( TransferEvent transferEvent ) {
                     System.out.println( "  Downloading " + transferEvent.getResource().getName() );
                 }
 
                 public void transferProgress( TransferEvent transferEvent, byte[] buffer, int length )
                 {
                     long totalLength = transferEvent.getResource().getContentLength();
-                    if ( buffer == null )
-                    {
-                        return;
-                    }
-
+                    if (buffer == null) { return; }
 
                     count += buffer.length;
 
-                    if ( ( count / unitChunk ) > kb )
-                    {
-                        if ( col > 80 )
-                        {
+                    if ((count / unitChunk) > kb) {
+                        if ( col > 80 ) {
                             System.out.println(String.format("%s/%s", sizeFmt(count), sizeFmt(totalLength)));
                             col = 0;
                         }
@@ -220,44 +213,31 @@ public class BasicUsageExample
                     }
                 }
 
-                public void transferCompleted( TransferEvent transferEvent )
-                {
+                public void transferCompleted( TransferEvent transferEvent ) {
                     System.out.println( " - Done" );
                 }
             };
 
-            ProxyInfo proxy = new ProxyInfo();
-            proxy.setHost("127.0.0.1");
-            proxy.setPort(1081);
-            proxy.setType("HTTP");
+        ProxyInfo proxy = new ProxyInfo();
+        ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher(httpWagon, listener, null, proxy);
 
-            ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher( httpWagon, listener, null, proxy );
+        Date centralContextCurrentTimestamp = centralContext.getTimestamp();
+        IndexUpdateRequest updateRequest = new IndexUpdateRequest(centralContext, resourceFetcher);
+        IndexUpdateResult updateResult = indexUpdater.fetchAndUpdateIndex(updateRequest);
 
-            Date centralContextCurrentTimestamp = centralContext.getTimestamp();
-            IndexUpdateRequest updateRequest = new IndexUpdateRequest( centralContext, resourceFetcher );
-            IndexUpdateResult updateResult = indexUpdater.fetchAndUpdateIndex( updateRequest );
-            if ( updateResult.isFullUpdate() )
-            {
+        if (updateResult.isFullUpdate()) {
                 System.out.println( "Full update happened!" );
-            }
-            else if ( updateResult.getTimestamp().equals( centralContextCurrentTimestamp ) )
-            {
-                System.out.println( "No update needed, index is up to date!" );
-            }
-            else
-            {
-                System.out.println(
-                    "Incremental update happened, change covered " + centralContextCurrentTimestamp + " - "
-                        + updateResult.getTimestamp() + " period." );
-            }
-
-            System.out.println();
         }
-
-        System.out.println();
+        else if (updateResult.getTimestamp().equals(centralContextCurrentTimestamp)) {
+            System.out.println( "No update needed, index is up to date!" );
+        }
+        else {
+            System.out.println(
+                               "Incremental update happened, change covered " + centralContextCurrentTimestamp + " - "
+                               + updateResult.getTimestamp() + " period." );
+        }
         System.out.println( "Using index" );
         System.out.println( "===========" );
-        System.out.println();
 
         // ====
 
@@ -266,23 +246,27 @@ public class BasicUsageExample
         // dump all the GAVs
         // NOTE: will not actually execute do this below, is too long to do (Central is HUGE), but is here as code
         // example
-        if (options.get("only-stat") != "1")
-        {
+        if (options.get("only-stat") != "1" && updateResult.isFullUpdate()) {
             final IndexSearcher searcher = centralContext.acquireIndexSearcher();
-            final ExecutorService executorService = Executors.newFixedThreadPool(16);
+            final int workers = 8;
+            final ThreadPoolExecutor executorService = new ThreadPoolExecutor(
+                                                                              workers,
+                                                                              workers,
+                                                                              0L,
+                                                                              TimeUnit.MILLISECONDS,
+                                                                              new ArrayBlockingQueue<Runnable>(workers),
+                                                                              new ThreadPoolExecutor.CallerRunsPolicy());
             try
             {
                 final IndexReader ir = searcher.getIndexReader();
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
-                int batchSize = 2000;
-                List<Future> futures = new ArrayList<Future>();
-                for ( int i = 0; i < ir.maxDoc(); i++ )
+                for ( int i = ir.maxDoc() - 1; i >= 0; i--)
                 {
                     if ( liveDocs == null || liveDocs.get( i ) )
                     {
                         final Document doc = ir.document( i );
                         final ArtifactInfo ai = IndexUtils.constructArtifactInfo( doc, centralContext );
-                        futures.add(executorService.submit(() -> {
+                        executorService.submit(() -> {
                             try {
                                 String artifactUrl = options.get("nexus-url")
                                         + '/' + ai.getGroupId().replace('.','/')
@@ -295,29 +279,8 @@ public class BasicUsageExample
                             } catch (Exception e) {
                                 System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
                             }
-                        }));
-                        if( batchSize-- < 0) {
-                           for(Future f: futures) {
-                               try {
-                                   f.get();
-                               } catch (Exception e) {
-                                   System.out.println("failed get result from future: " + e.toString());
-                               }
-                           }
-                           futures.clear();
-                           batchSize = 2000;
-                        }
+                        });
                     }
-                }
-                if (!futures.isEmpty()) {
-                    for(Future f: futures) {
-                        try {
-                            f.get();
-                        } catch (Exception e) {
-                            System.out.println("failed get result from future: " + e.toString());
-                        }
-                    }
-                    futures.clear();
                 }
             } finally {
                 centralContext.releaseIndexSearcher(searcher);
