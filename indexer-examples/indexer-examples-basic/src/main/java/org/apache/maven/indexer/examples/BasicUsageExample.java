@@ -105,11 +105,22 @@ public class BasicUsageExample
             String indexDir = line.getOptionValue("index-dir");
             String indexUrl = "https://repo1.maven.org/maven2";
             String nexusUrl = "http://mirrors.gitee.com/repository/maven-public";
+            String groupId = "";
+            String artifactId = "";
             if (line.hasOption("index-url")) {
                 indexUrl = line.getOptionValue("index-url");
             }
             if (line.hasOption("nexus-url")) {
                 nexusUrl = line.getOptionValue("nexus-url");
+            }
+            if (line.hasOption("last-sync")) {
+
+                String [] gav = line.getOptionValue("last-sync").split(",");
+                if (gav.length == 2) {
+                    groupId = gav[0];
+                    artifactId = gav[1];
+                    System.out.println("begin point : " + groupId + " " + artifactId);
+                }
             }
             boolean onlyStat = line.hasOption("stat");
             HashMap<String, String> options = new HashMap<String, String>();
@@ -117,6 +128,8 @@ public class BasicUsageExample
             options.put("index-dir", indexDir);
             options.put("index-url", indexUrl);
             options.put("nexus-url", nexusUrl);
+            options.put("last-group-id", groupId);
+            options.put("last-artifact-id", artifactId);
             options.put("only-stat", line.hasOption("stat") ? "1" : "0");
             basicUsageExample.perform(options);
         } else {
@@ -258,28 +271,54 @@ public class BasicUsageExample
                                                                               new ThreadPoolExecutor.CallerRunsPolicy());
             try
             {
+                boolean haslastPoint = false;
+                boolean begin = false;
+                String lastGroupId = options.get("last-group-id");
+                String lastArtifactId = options.get("last-artifact-id");
+                if (lastGroupId != "" && lastArtifactId != "") {
+                    Query gidQ = indexer.constructQuery(MAVEN.GROUP_ID, new SourcedSearchExpression(lastGroupId));
+                    Query aidQ = indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression(lastArtifactId));
+                    BooleanQuery bq = new BooleanQuery.Builder()
+                        .add( gidQ, Occur.MUST )
+                        .add( aidQ, Occur.MUST )
+                        .build();
+                    haslastPoint  = searchExistResult(indexer, bq);
+                }
                 final IndexReader ir = searcher.getIndexReader();
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
                 for ( int i = ir.maxDoc() - 1; i >= 0; i--)
                 {
                     if ( liveDocs == null || liveDocs.get( i ) )
                     {
+
                         final Document doc = ir.document( i );
                         final ArtifactInfo ai = IndexUtils.constructArtifactInfo( doc, centralContext );
-                        executorService.submit(() -> {
-                            try {
-                                String artifactUrl = options.get("nexus-url")
-                                        + '/' + ai.getGroupId().replace('.','/')
-                                        + '/' + ai.getArtifactId()
-                                        + '/' + ai.getVersion()
-                                        + '/' + ai.getArtifactId()
-                                        + '-' + ai.getVersion()
-                                        + '.' + ai.getFileExtension();
-                                downloadFile(artifactUrl);
-                            } catch (Exception e) {
-                                System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
+                        if (ai != null) {
+                            if (haslastPoint && !begin) {
+                                String currentGroupId = ai.getGroupId();
+                                String currentArtifactId = ai.getArtifactId();
+                                if (lastGroupId == currentGroupId && lastArtifactId == currentArtifactId) {
+                                    begin = true;
+                                } else {
+                                    System.out.println("skiped " + currentGroupId + " " + currentArtifactId);
+                                    continue;
+                                }
                             }
-                        });
+                            executorService.submit(() -> {
+                                    try {
+                                        String artifactUrl = options.get("nexus-url")
+                                            + '/' + ai.getGroupId().replace('.','/')
+                                            + '/' + ai.getArtifactId()
+                                            + '/' + ai.getVersion()
+                                            + '/' + ai.getArtifactId()
+                                            + '-' + ai.getVersion()
+                                            + '.' + ai.getFileExtension();
+                                        downloadFile(artifactUrl);
+                                    } catch (Exception e) {
+                                        System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
+                                    }
+                                });
+                        }
                     }
                 }
             } finally {
@@ -420,6 +459,11 @@ public class BasicUsageExample
         indexer.closeIndexingContext( centralContext, false );
     }
 
+    public boolean searchExistResult(Indexer nexusIndexer, Query q) throws IOException {
+        FlatSearchResponse response = nexusIndexer.searchFlat(new FlatSearchRequest(q, centralContext));
+        return response.getTotalHitsCount() > 0;
+    }
+
     public void searchAndDump( Indexer nexusIndexer, String descr, Query q )
         throws IOException
     {
@@ -464,10 +508,11 @@ public class BasicUsageExample
 
     private static Options getOptions() {
         Options options = new Options();
-        options.addOption("c","cache-dir", true, "the path to local central cache dir");
+        options.addOption("c", "cache-dir", true, "the path to local central cache dir");
         options.addOption("i", "index-dir", true, "the path to local lucene dir");
         options.addOption("r", "index-url", true, "the parent url of remote central index" );
-        options.addOption("n","nexus-url", true, "the repository url of nexus");
+        options.addOption("n", "nexus-url", true, "the repository url of nexus");
+        options.addOption("l", "last-sync", true, "set last sync point");
         options.addOption("s", "stat", false, "only get artifacts statistics information");
         return options;
     }
@@ -481,7 +526,15 @@ public class BasicUsageExample
             if(response.getStatusLine().getStatusCode() == 200) {
                 System.out.println("downloaded " + uri + " successfully!");
             } else {
-                System.out.println("failed to downloaded " + uri);
+                int code = response.getStatusLine().getStatusCode();
+                switch (code) {
+                case 404:
+                    System.out.println("[404] Not found failed to downloaded " + uri);
+                case 500:
+                    System.out.println("[500] Server error failed to downloaded " + uri);
+                default:
+                    System.out.println(String.format("[%d] Unknown error failed to downloaded ", code) + uri);
+                }
             }
         } finally {
             if (response != null) {

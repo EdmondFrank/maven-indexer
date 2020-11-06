@@ -280,7 +280,15 @@ public class DefaultIndexUpdater
             if(response.getStatusLine().getStatusCode() == 200) {
                 System.out.println("downloaded " + uri + " successfully!");
             } else {
-                System.out.println("failed to downloaded " + uri);
+                int code = response.getStatusLine().getStatusCode();
+                switch (code) {
+                case 404:
+                    System.out.println("[404] Not found failed to downloaded " + uri);
+                case 500:
+                    System.out.println("[500] Server error failed to downloaded " + uri);
+                default:
+                    System.out.println(String.format("[%d] Unknown error failed to downloaded ", code) + uri);
+                }
             }
         } finally {
             if (response != null) {
