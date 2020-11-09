@@ -19,11 +19,16 @@ package org.apache.maven.indexer.examples;
  * under the License.
  */
 
+import org.apache.http.HttpEntity;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.config.RequestConfig.Builder;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.FutureRequestExecutionMetrics;
 import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
+import org.apache.http.client.methods.HttpHead;
+
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.MultiFields;
@@ -82,14 +87,13 @@ import org.apache.commons.cli.ParseException;
 import java.io.File;
 import java.io.IOException;
 
-import java.io.InputStream;
 import java.util.*;
+
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -97,6 +101,12 @@ import java.util.concurrent.TimeUnit;
  */
 public class BasicUsageExample
 {
+    public static String centralUrl = "";
+    public static String nexusUrl = "";
+    public static String globalProxy = "";
+    public static int workers = 8;
+    public static int producers = 3;
+
     public static void main( String[] args ) throws Exception {
         final BasicUsageExample basicUsageExample = new BasicUsageExample();
         CommandLine line = parseArguments(args);
@@ -107,11 +117,15 @@ public class BasicUsageExample
             String nexusUrl = "http://mirrors.gitee.com/repository/maven-public";
             String groupId = "";
             String artifactId = "";
+            String proxy = "";
             if (line.hasOption("index-url")) {
                 indexUrl = line.getOptionValue("index-url");
             }
             if (line.hasOption("nexus-url")) {
                 nexusUrl = line.getOptionValue("nexus-url");
+            }
+            if (line.hasOption("proxy")) {
+                proxy = line.getOptionValue("proxy");
             }
             if (line.hasOption("last-sync")) {
 
@@ -124,12 +138,14 @@ public class BasicUsageExample
             }
             boolean onlyStat = line.hasOption("stat");
             HashMap<String, String> options = new HashMap<String, String>();
+            BasicUsageExample.centralUrl = indexUrl;
+            BasicUsageExample.nexusUrl = nexusUrl;
+            BasicUsageExample.globalProxy = proxy;
             options.put("cache-dir", cacheDir);
             options.put("index-dir", indexDir);
-            options.put("index-url", indexUrl);
-            options.put("nexus-url", nexusUrl);
             options.put("last-group-id", groupId);
             options.put("last-artifact-id", artifactId);
+            options.put("proxy", proxy);
             options.put("only-stat", line.hasOption("stat") ? "1" : "0");
             basicUsageExample.perform(options);
         } else {
@@ -186,7 +202,7 @@ public class BasicUsageExample
         centralContext = indexer.createIndexingContext(
                 "central-context", "central",
                 centralLocalCache, centralIndexDir,
-                options.get("index-url"), null, true, true, indexers );
+                BasicUsageExample.centralUrl, null, true, true, indexers );
 
         // Update the index (incremental update will happen if this is not 1st run and files are not deleted)
         // This whole block below should not be executed on every app start, but rather controlled by some configuration
@@ -198,57 +214,67 @@ public class BasicUsageExample
         System.out.println( "This might take a while on first run, so please be patient!" );
         // Create ResourceFetcher implementation to be used with IndexUpdateRequest
         // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
-        TransferListener listener = new AbstractTransferListener() {
-                private int count = 0;
-                private int unitChunk = 64;
-                private int col = 0;
-                private int kb = 0;
-                public void transferStarted( TransferEvent transferEvent ) {
-                    System.out.println( "  Downloading " + transferEvent.getResource().getName() );
-                }
+       TransferListener listener = new AbstractTransferListener() {
+               private int count = 0;
+               private int unitChunk = 64;
+               private int col = 0;
+               private int kb = 0;
 
-                public void transferProgress( TransferEvent transferEvent, byte[] buffer, int length )
-                {
-                    long totalLength = transferEvent.getResource().getContentLength();
-                    if (buffer == null) { return; }
+               public void transferStarted(TransferEvent transferEvent) {
+                   System.out.println("  Downloading " + transferEvent.getResource().getName());
+               }
 
-                    count += buffer.length;
+               public void transferProgress(TransferEvent transferEvent, byte[] buffer, int length) {
+                   long totalLength = transferEvent.getResource().getContentLength();
+                   if (buffer == null) {
+                       return;
+                   }
 
-                    if ((count / unitChunk) > kb) {
-                        if ( col > 80 ) {
-                            System.out.println(String.format("%s/%s", sizeFmt(count), sizeFmt(totalLength)));
-                            col = 0;
-                        }
+                   count += buffer.length;
 
-                        System.out.print( '.' );
-                        col++;
-                        kb++;
-                    }
-                }
+                   if ((count / unitChunk) > kb) {
+                       if (col > 80) {
+                           System.out.println(String.format("%s/%s", sizeFmt(count), sizeFmt(totalLength)));
+                           col = 0;
+                       }
 
-                public void transferCompleted( TransferEvent transferEvent ) {
-                    System.out.println( " - Done" );
-                }
-            };
+                       System.out.print('.');
+                       col++;
+                       kb++;
+                   }
+               }
 
-        ProxyInfo proxy = new ProxyInfo();
-        ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher(httpWagon, listener, null, proxy);
+               public void transferCompleted(TransferEvent transferEvent) {
+                   System.out.println(" - Done");
+               }
+           };
 
-        Date centralContextCurrentTimestamp = centralContext.getTimestamp();
-        IndexUpdateRequest updateRequest = new IndexUpdateRequest(centralContext, resourceFetcher);
-        IndexUpdateResult updateResult = indexUpdater.fetchAndUpdateIndex(updateRequest);
+       ProxyInfo proxy = new ProxyInfo();
+       if (options.get("proxy") != "") {
+           try {
+               String proxyStr = options.get("proxy");
+               String[] ipInfo = proxyStr.split(":");
+               proxy.setHost(ipInfo[0]);
+               proxy.setPort(Integer.parseInt(ipInfo[1], 10));
+               proxy.setType("HTTP");
+           } catch (Exception e) {
+               System.out.println("invaild proxy! correct format: host:<port>");
+           }
+       }
+       ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher(httpWagon, listener, null, proxy);
+       Date centralContextCurrentTimestamp = centralContext.getTimestamp();
+       IndexUpdateRequest updateRequest = new IndexUpdateRequest(centralContext, resourceFetcher);
+       IndexUpdateResult updateResult = indexUpdater.fetchAndUpdateIndex(updateRequest);
 
-        if (updateResult.isFullUpdate()) {
-                System.out.println( "Full update happened!" );
-        }
-        else if (updateResult.getTimestamp().equals(centralContextCurrentTimestamp)) {
-            System.out.println( "No update needed, index is up to date!" );
-        }
-        else {
-            System.out.println(
-                               "Incremental update happened, change covered " + centralContextCurrentTimestamp + " - "
-                               + updateResult.getTimestamp() + " period." );
-        }
+       if (updateResult.isFullUpdate()) {
+           System.out.println("Full update happened!");
+       } else if (updateResult.getTimestamp().equals(centralContextCurrentTimestamp)) {
+           System.out.println("No update needed, index is up to date!");
+       } else {
+           System.out.println(
+                              "Incremental update happened, change covered " + centralContextCurrentTimestamp + " - "
+                              + updateResult.getTimestamp() + " period.");
+       }
         System.out.println( "Using index" );
         System.out.println( "===========" );
 
@@ -259,19 +285,19 @@ public class BasicUsageExample
         // dump all the GAVs
         // NOTE: will not actually execute do this below, is too long to do (Central is HUGE), but is here as code
         // example
-        if (options.get("only-stat") != "1" && updateResult.isFullUpdate()) {
+        if (options.get("only-stat") != "1") {
             final IndexSearcher searcher = centralContext.acquireIndexSearcher();
-            final int workers = 8;
             final ThreadPoolExecutor executorService = new ThreadPoolExecutor(
-                                                                              workers,
-                                                                              workers,
-                                                                              0L,
-                                                                              TimeUnit.MILLISECONDS,
-                                                                              new ArrayBlockingQueue<Runnable>(workers),
-                                                                              new ThreadPoolExecutor.CallerRunsPolicy());
+                    BasicUsageExample.producers,
+                    BasicUsageExample.producers,
+                    0L,
+                    TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<Runnable>(BasicUsageExample.producers),
+                    new ThreadPoolExecutor.CallerRunsPolicy());
             try
             {
                 boolean haslastPoint = false;
+                ArtifactInfo lastPoint = null;
                 boolean begin = false;
                 String lastGroupId = options.get("last-group-id");
                 String lastArtifactId = options.get("last-artifact-id");
@@ -282,10 +308,14 @@ public class BasicUsageExample
                         .add( gidQ, Occur.MUST )
                         .add( aidQ, Occur.MUST )
                         .build();
-                    haslastPoint  = searchExistResult(indexer, bq);
+                    lastPoint = searchExistResult(indexer, bq);
+                    if (lastPoint != null) {
+                        haslastPoint = true;
+                    }
                 }
                 final IndexReader ir = searcher.getIndexReader();
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
+                ArtifactInfo prev = null;
                 for ( int i = ir.maxDoc() - 1; i >= 0; i--)
                 {
                     if ( liveDocs == null || liveDocs.get( i ) )
@@ -297,27 +327,32 @@ public class BasicUsageExample
                             if (haslastPoint && !begin) {
                                 String currentGroupId = ai.getGroupId();
                                 String currentArtifactId = ai.getArtifactId();
-                                if (lastGroupId == currentGroupId && lastArtifactId == currentArtifactId) {
+                                if (lastPoint.getGroupId().equals(currentGroupId) &&
+                                        lastPoint.getArtifactId().equals(currentArtifactId)) {
                                     begin = true;
                                 } else {
                                     System.out.println("skiped " + currentGroupId + " " + currentArtifactId);
                                     continue;
                                 }
                             }
+
+                            if (prev != null &&
+                                    prev.getGroupId().equals(ai.getGroupId()) &&
+                                    prev.getArtifactId().equals(ai.getArtifactId()) &&
+                                    prev.getVersion().equals((ai.getVersion()))) {
+                                continue;
+                            }
+                            String artifactPath = '/' + ai.getGroupId().replace('.','/')
+                                    + '/' + ai.getArtifactId()
+                                    + '/' + ai.getVersion();
                             executorService.submit(() -> {
                                     try {
-                                        String artifactUrl = options.get("nexus-url")
-                                            + '/' + ai.getGroupId().replace('.','/')
-                                            + '/' + ai.getArtifactId()
-                                            + '/' + ai.getVersion()
-                                            + '/' + ai.getArtifactId()
-                                            + '-' + ai.getVersion()
-                                            + '.' + ai.getFileExtension();
-                                        downloadFile(artifactUrl);
+                                        fetchDir(artifactPath);
                                     } catch (Exception e) {
-                                        System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
+                                        System.out.println("failed to fetch:" + artifactPath + "\n" + e.toString());
                                     }
                                 });
+                            prev = ai;
                         }
                     }
                 }
@@ -348,162 +383,13 @@ public class BasicUsageExample
             }
         }
 
-        // ====
-        // Case:
-        // Search for all GAVs with known G and A and having version greater than V
-//
-//        final GenericVersionScheme versionScheme = new GenericVersionScheme();
-//        final String versionString = "1.5.0";
-//        final Version version = versionScheme.parseVersion( versionString );
-//
-//        // construct the query for known GA
-//        final Query groupIdQ =
-//            indexer.constructQuery( MAVEN.GROUP_ID, new SourcedSearchExpression( "org.sonatype.nexus" ) );
-//        final Query artifactIdQ =
-//            indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression( "nexus-api" ) );
-//
-//        final BooleanQuery query = new BooleanQuery.Builder()
-//            .add( groupIdQ, Occur.MUST )
-//            .add( artifactIdQ, Occur.MUST )
-//            // we want "jar" artifacts only
-//            .add( indexer.constructQuery( MAVEN.PACKAGING, new SourcedSearchExpression( "jar" ) ), Occur.MUST )
-//            // we want main artifacts only (no classifier)
-//            // Note: this below is unfinished API, needs fixing
-//            .add( indexer.constructQuery( MAVEN.CLASSIFIER,
-//                    new SourcedSearchExpression( Field.NOT_PRESENT ) ), Occur.MUST_NOT )
-//            .build();
-//
-//        // construct the filter to express "V greater than"
-//        final ArtifactInfoFilter versionFilter = new ArtifactInfoFilter()
-//        {
-//            public boolean accepts( final IndexingContext ctx, final ArtifactInfo ai )
-//            {
-//                try
-//                {
-//                    final Version aiV = versionScheme.parseVersion( ai.getVersion() );
-//                    // Use ">=" if you are INCLUSIVE
-//                    return aiV.compareTo( version ) > 0;
-//                }
-//                catch ( InvalidVersionSpecificationException e )
-//                {
-//                    // do something here? be safe and include?
-//                    return true;
-//                }
-//            }
-//        };
-//
-//        System.out.println(
-//            "Searching for all GAVs with G=org.sonatype.nexus and nexus-api and having V greater than 1.5.0" );
-//        final IteratorSearchRequest request =
-//            new IteratorSearchRequest( query, Collections.singletonList( centralContext ), versionFilter );
-//        final IteratorSearchResponse response = indexer.searchIterator( request );
-//        for ( ArtifactInfo ai : response )
-//        {
-//            System.out.println( ai.toString() );
-//        }
-//
-//        // Case:
-//        // Use index
-//        // Searching for some artifact
-//        Query gidQ =
-//            indexer.constructQuery( MAVEN.GROUP_ID, new SourcedSearchExpression( "org.apache.maven.indexer" ) );
-//        Query aidQ = indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression( "indexer-artifact" ) );
-//
-//        BooleanQuery bq = new BooleanQuery.Builder()
-//                .add( gidQ, Occur.MUST )
-//                .add( aidQ, Occur.MUST )
-//                .build();
-//
-//        searchAndDump( indexer, "all artifacts under GA org.apache.maven.indexer:indexer-artifact", bq );
-//
-//        // Searching for some main artifact
-//        bq = new BooleanQuery.Builder()
-//                .add( gidQ, Occur.MUST )
-//                .add( aidQ, Occur.MUST )
-////                .add( indexer.constructQuery( MAVEN.CLASSIFIER, new SourcedSearchExpression( "*" ) ), Occur.MUST_NOT )
-//                .build();
-//
-//        searchAndDump( indexer, "main artifacts under GA org.apache.maven.indexer:indexer-artifact", bq );
-//
-//        // doing sha1 search
-//        searchAndDump( indexer, "SHA1 7ab67e6b20e5332a7fb4fdf2f019aec4275846c2",
-//                       indexer.constructQuery( MAVEN.SHA1,
-//                                               new SourcedSearchExpression( "7ab67e6b20e5332a7fb4fdf2f019aec4275846c2" )
-//                       )
-//        );
-//
-//        searchAndDump( indexer, "SHA1 7ab67e6b20 (partial hash)",
-//                       indexer.constructQuery( MAVEN.SHA1, new UserInputSearchExpression( "7ab67e6b20" ) ) );
-//
-//        // doing classname search (incomplete classname)
-//        searchAndDump( indexer, "classname DefaultNexusIndexer (note: Central does not publish classes in the index)",
-//                       indexer.constructQuery( MAVEN.CLASSNAMES,
-//                                               new UserInputSearchExpression( "DefaultNexusIndexer" ) ) );
-//
-//        // doing search for all "canonical" maven plugins latest versions
-//        bq = new BooleanQuery.Builder()
-//            .add( indexer.constructQuery( MAVEN.PACKAGING, new SourcedSearchExpression( "maven-plugin" ) ), Occur.MUST )
-//            .add( indexer.constructQuery( MAVEN.GROUP_ID,
-//                    new SourcedSearchExpression( "org.apache.maven.plugins" ) ), Occur.MUST )
-//            .build();
-//
-//        searchGroupedAndDump( indexer, "all \"canonical\" maven plugins", bq, new GAGrouping() );
-//
-//        // doing search for all archetypes latest versions
-//        searchGroupedAndDump( indexer, "all maven archetypes (latest versions)",
-//                              indexer.constructQuery( MAVEN.PACKAGING,
-//                                                      new SourcedSearchExpression( "maven-archetype" ) ),
-//                              new GAGrouping() );
-
         // close cleanly
         indexer.closeIndexingContext( centralContext, false );
     }
 
-    public boolean searchExistResult(Indexer nexusIndexer, Query q) throws IOException {
-        FlatSearchResponse response = nexusIndexer.searchFlat(new FlatSearchRequest(q, centralContext));
-        return response.getTotalHitsCount() > 0;
-    }
-
-    public void searchAndDump( Indexer nexusIndexer, String descr, Query q )
-        throws IOException
-    {
-        System.out.println( "Searching for " + descr );
-
-        FlatSearchResponse response = nexusIndexer.searchFlat( new FlatSearchRequest( q, centralContext ) );
-
-        for ( ArtifactInfo ai : response.getResults() )
-        {
-            System.out.println( ai.toString() );
-        }
-
-        System.out.println( "------" );
-        System.out.println( "Total: " + response.getTotalHitsCount() );
-        System.out.println();
-    }
-
-    private static final int MAX_WIDTH = 60;
-
-    public void searchGroupedAndDump( Indexer nexusIndexer, String descr, Query q, Grouping g )
-        throws IOException
-    {
-        System.out.println( "Searching for " + descr );
-
-        GroupedSearchResponse response = nexusIndexer.searchGrouped( new GroupedSearchRequest( q, g, centralContext ) );
-
-        for ( Map.Entry<String, ArtifactInfoGroup> entry : response.getResults().entrySet() )
-        {
-            ArtifactInfo ai = entry.getValue().getArtifactInfos().iterator().next();
-            System.out.println( "* Entry " + ai );
-            System.out.println( "  Latest version:  " + ai.getVersion() );
-            System.out.println( StringUtils.isBlank( ai.getDescription() )
-                                    ? "No description in plugin's POM."
-                                    : StringUtils.abbreviate( ai.getDescription(), MAX_WIDTH ) );
-            System.out.println();
-        }
-
-        System.out.println( "------" );
-        System.out.println( "Total record hits: " + response.getTotalHitsCount() );
-        System.out.println();
+    public ArtifactInfo searchExistResult(Indexer nexusIndexer, Query q) throws IOException {
+        Collection<ArtifactInfo> response = nexusIndexer.identify(q, Collections.singletonList(centralContext));
+        return response.iterator().hasNext() ? response.iterator().next() : null;
     }
 
     private static Options getOptions() {
@@ -513,8 +399,63 @@ public class BasicUsageExample
         options.addOption("r", "index-url", true, "the parent url of remote central index" );
         options.addOption("n", "nexus-url", true, "the repository url of nexus");
         options.addOption("l", "last-sync", true, "set last sync point");
+        options.addOption("x", "proxy", true, "set proxy for index updater");
         options.addOption("s", "stat", false, "only get artifacts statistics information");
         return options;
+    }
+
+    private static void fetchDir(String subDir) throws Exception {
+        String content = httpGetText(buildCentralUrl(subDir));
+        List<String> linkList = new ArrayList<String>();
+        final String linkRegex = "<a href=\"(.*?)\".*>(.*?)<\\/a>";
+        final Pattern linkPattern = Pattern.compile(linkRegex);
+        Matcher matcher = linkPattern.matcher(content);
+        while (matcher.find()) {
+            String href = matcher.group(1);
+            String title = matcher.group(2);
+            linkList.add(href);
+        }
+        final ThreadPoolExecutor executorService = new ThreadPoolExecutor(
+                BasicUsageExample.workers,
+                BasicUsageExample.workers,
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<Runnable>(BasicUsageExample.workers),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+            for (String artifactUrl : linkList) {
+                if (artifactUrl != null && !artifactUrl.startsWith("..") && !artifactUrl.endsWith("/")) {
+                    String pkgUrl = buildNexusUrl(subDir + "/" + artifactUrl);
+                    executorService.submit(() -> {
+                        try {
+                            if(!existFile(pkgUrl)) {
+                                downloadFile(pkgUrl);
+                            }
+                            System.out.println("successfully downloaded: " + pkgUrl);
+                        } catch (Exception e) {
+                            System.out.println("failed to download: " + pkgUrl + " error: " + e.toString());
+                        }
+                    });
+                }
+            }
+    }
+
+    private static boolean existFile(String uri) throws Exception {
+        CloseableHttpClient httpclient = HttpClients.createDefault();
+        HttpHead head = new HttpHead(uri);
+        CloseableHttpResponse response = null;
+        try {
+            response = httpclient.execute(head);
+            if(response.getStatusLine().getStatusCode() == 200) {
+                return true;
+            } else {
+                return false;
+            }
+        } finally {
+            if (response != null) {
+                response.close();
+            }
+            httpclient.close();
+        }
     }
 
     private static void downloadFile(String uri) throws Exception {
@@ -543,6 +484,41 @@ public class BasicUsageExample
             httpclient.close();
         }
     }
+
+    public static String httpGetText(String url) {
+        String result = "";
+        HttpGet request = buildRequest(url, 15);
+        try (CloseableHttpClient httpClient = HttpClients.createDefault();
+             CloseableHttpResponse response = httpClient.execute(request)) {
+            HttpEntity entity = response.getEntity();
+            if (entity != null) {
+                result = EntityUtils.toString(entity);
+            }
+        } finally {
+            return result;
+        }
+    }
+
+    private static HttpGet buildRequest(String url, int timeoutInSeconds) {
+        RequestConfig requestConfig;
+        Builder builder = RequestConfig.custom()
+                .setConnectionRequestTimeout(timeoutInSeconds * 1000)
+                .setSocketTimeout(timeoutInSeconds * 1000);
+        requestConfig = builder.build();
+        HttpGet request = new HttpGet(url);
+        request.setConfig(requestConfig);
+        request.setHeader("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Safari/537.36");
+        return request;
+    }
+
+    private static String buildCentralUrl(String relativePath) {
+        return String.format("%s%s", BasicUsageExample.centralUrl, relativePath);
+    }
+
+    private static String buildNexusUrl(String relativePath) {
+        return String.format("%s%s", BasicUsageExample.nexusUrl, relativePath);
+    }
+
     private static String sizeFmt(long num) {
         return sizeFmt(num, "iB");
     }
