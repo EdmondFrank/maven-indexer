@@ -466,8 +466,10 @@ public class BasicUsageExample
                 switch (code) {
                 case 404:
                     System.out.println("[404] Not found failed to downloaded " + uri);
+                    break;
                 case 500:
                     System.out.println("[500] Server error failed to downloaded " + uri);
+                    break;
                 default:
                     System.out.println(String.format("[%d] Unknown error failed to downloaded ", code) + uri);
                 }
