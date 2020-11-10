@@ -38,24 +38,12 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.Bits;
 import org.apache.maven.index.ArtifactInfo;
-import org.apache.maven.index.ArtifactInfoFilter;
-import org.apache.maven.index.ArtifactInfoGroup;
-import org.apache.maven.index.Field;
-import org.apache.maven.index.FlatSearchRequest;
-import org.apache.maven.index.FlatSearchResponse;
-import org.apache.maven.index.GroupedSearchRequest;
-import org.apache.maven.index.GroupedSearchResponse;
-import org.apache.maven.index.Grouping;
 import org.apache.maven.index.Indexer;
-import org.apache.maven.index.IteratorSearchRequest;
-import org.apache.maven.index.IteratorSearchResponse;
 import org.apache.maven.index.MAVEN;
 import org.apache.maven.index.context.IndexCreator;
 import org.apache.maven.index.context.IndexUtils;
 import org.apache.maven.index.context.IndexingContext;
 import org.apache.maven.index.expr.SourcedSearchExpression;
-import org.apache.maven.index.expr.UserInputSearchExpression;
-import org.apache.maven.index.search.grouping.GAGrouping;
 import org.apache.maven.index.updater.IndexUpdateRequest;
 import org.apache.maven.index.updater.IndexUpdateResult;
 import org.apache.maven.index.updater.IndexUpdater;
@@ -72,10 +60,7 @@ import org.codehaus.plexus.PlexusConstants;
 import org.codehaus.plexus.PlexusContainer;
 import org.codehaus.plexus.PlexusContainerException;
 import org.codehaus.plexus.component.repository.exception.ComponentLookupException;
-import org.codehaus.plexus.util.StringUtils;
-import org.eclipse.aether.util.version.GenericVersionScheme;
 import org.eclipse.aether.version.InvalidVersionSpecificationException;
-import org.eclipse.aether.version.Version;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -88,7 +73,6 @@ import java.io.File;
 import java.io.IOException;
 
 import java.util.*;
-
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -101,11 +85,11 @@ import java.util.concurrent.TimeUnit;
  */
 public class BasicUsageExample
 {
-    public static String centralUrl = "";
-    public static String nexusUrl = "";
-    public static String globalProxy = "";
-    public static int workers = 8;
-    public static int producers = 3;
+    private static String centralUrl = "";
+    private static String nexusUrl = "";
+    private static String globalProxy = "";
+    private static int workers = 8;
+    private static int producers = 4;
 
     public static void main( String[] args ) throws Exception {
         final BasicUsageExample basicUsageExample = new BasicUsageExample();
@@ -117,7 +101,6 @@ public class BasicUsageExample
             String nexusUrl = "http://mirrors.gitee.com/repository/maven-public";
             String groupId = "";
             String artifactId = "";
-            String proxy = "";
             if (line.hasOption("index-url")) {
                 indexUrl = line.getOptionValue("index-url");
             }
@@ -125,7 +108,21 @@ public class BasicUsageExample
                 nexusUrl = line.getOptionValue("nexus-url");
             }
             if (line.hasOption("proxy")) {
-                proxy = line.getOptionValue("proxy");
+                BasicUsageExample.globalProxy = line.getOptionValue("proxy");
+            }
+            if (line.hasOption("workers")) {
+                try {
+                    BasicUsageExample.workers  = Integer.parseInt(line.getOptionValue("workers"));
+                } catch (NumberFormatException ex) {
+                    BasicUsageExample.workers = 8;
+                }
+            }
+            if (line.hasOption("producers")) {
+                try {
+                    BasicUsageExample.producers  = Integer.parseInt(line.getOptionValue("producers"));
+                } catch (NumberFormatException ex) {
+                    BasicUsageExample.producers = 4;
+                }
             }
             if (line.hasOption("last-sync")) {
 
@@ -136,16 +133,13 @@ public class BasicUsageExample
                     System.out.println("begin point : " + groupId + " " + artifactId);
                 }
             }
-            boolean onlyStat = line.hasOption("stat");
             HashMap<String, String> options = new HashMap<String, String>();
             BasicUsageExample.centralUrl = indexUrl;
             BasicUsageExample.nexusUrl = nexusUrl;
-            BasicUsageExample.globalProxy = proxy;
             options.put("cache-dir", cacheDir);
             options.put("index-dir", indexDir);
             options.put("last-group-id", groupId);
             options.put("last-artifact-id", artifactId);
-            options.put("proxy", proxy);
             options.put("only-stat", line.hasOption("stat") ? "1" : "0");
             basicUsageExample.perform(options);
         } else {
@@ -168,11 +162,6 @@ public class BasicUsageExample
     public BasicUsageExample()
         throws PlexusContainerException, ComponentLookupException
     {
-        // here we create Plexus container, the Maven default IoC container
-        // Plexus falls outside of MI scope, just accept the fact that
-        // MI is a Plexus component ;)
-        // If needed more info, ask on Maven Users list or Plexus Users list
-        // google is your friend!
         final DefaultContainerConfiguration config = new DefaultContainerConfiguration();
         config.setClassPathScanning( PlexusConstants.SCANNING_INDEX );
         this.plexusContainer = new DefaultPlexusContainer( config );
@@ -250,15 +239,15 @@ public class BasicUsageExample
            };
 
        ProxyInfo proxy = new ProxyInfo();
-       if (options.get("proxy") != "") {
+       if (BasicUsageExample.globalProxy != "") {
            try {
-               String proxyStr = options.get("proxy");
-               String[] ipInfo = proxyStr.split(":");
+               String[] ipInfo = BasicUsageExample.globalProxy.split(":");
                proxy.setHost(ipInfo[0]);
                proxy.setPort(Integer.parseInt(ipInfo[1], 10));
                proxy.setType("HTTP");
            } catch (Exception e) {
                System.out.println("invaild proxy! correct format: host:<port>");
+               throw e;
            }
        }
        ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher(httpWagon, listener, null, proxy);
@@ -293,6 +282,13 @@ public class BasicUsageExample
                     0L,
                     TimeUnit.MILLISECONDS,
                     new ArrayBlockingQueue<Runnable>(BasicUsageExample.producers),
+                    new ThreadPoolExecutor.CallerRunsPolicy());
+            final ThreadPoolExecutor workerService = new ThreadPoolExecutor(
+                    BasicUsageExample.workers,
+                    BasicUsageExample.workers,
+                    0L,
+                    TimeUnit.MICROSECONDS,
+                    new ArrayBlockingQueue<Runnable>(BasicUsageExample.workers),
                     new ThreadPoolExecutor.CallerRunsPolicy());
             try
             {
@@ -347,7 +343,7 @@ public class BasicUsageExample
                                     + '/' + ai.getVersion();
                             executorService.submit(() -> {
                                     try {
-                                        fetchDir(artifactPath);
+                                        fetchDir(artifactPath, workerService);
                                     } catch (Exception e) {
                                         System.out.println("failed to fetch:" + artifactPath + "\n" + e.toString());
                                     }
@@ -359,7 +355,9 @@ public class BasicUsageExample
             } finally {
                 centralContext.releaseIndexSearcher(searcher);
                 executorService.shutdown();
+                workerService.shutdown();
                 executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
+                workerService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
             }
         } else {
             final IndexSearcher searcher = centralContext.acquireIndexSearcher();
@@ -400,11 +398,13 @@ public class BasicUsageExample
         options.addOption("n", "nexus-url", true, "the repository url of nexus");
         options.addOption("l", "last-sync", true, "set last sync point");
         options.addOption("x", "proxy", true, "set proxy for index updater");
+        options.addOption("w", "workers", true,"set nums of download workers");
+        options.addOption("p", "producers", true, "set nums of url fetchers");
         options.addOption("s", "stat", false, "only get artifacts statistics information");
         return options;
     }
 
-    private static void fetchDir(String subDir) throws Exception {
+    private static void fetchDir(String subDir, ThreadPoolExecutor workerService) throws Exception {
         String content = httpGetText(buildCentralUrl(subDir));
         List<String> linkList = new ArrayList<String>();
         final String linkRegex = "<a href=\"(.*?)\".*>(.*?)<\\/a>";
@@ -415,28 +415,23 @@ public class BasicUsageExample
             String title = matcher.group(2);
             linkList.add(href);
         }
-        final ThreadPoolExecutor executorService = new ThreadPoolExecutor(
-                BasicUsageExample.workers,
-                BasicUsageExample.workers,
-                0L,
-                TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<Runnable>(BasicUsageExample.workers),
-                new ThreadPoolExecutor.CallerRunsPolicy());
-            for (String artifactUrl : linkList) {
-                if (artifactUrl != null && !artifactUrl.startsWith("..") && !artifactUrl.endsWith("/")) {
-                    String pkgUrl = buildNexusUrl(subDir + "/" + artifactUrl);
-                    executorService.submit(() -> {
-                        try {
-                            if(!existFile(pkgUrl)) {
-                                downloadFile(pkgUrl);
-                            }
+        for (String artifactUrl : linkList) {
+            if (artifactUrl != null && !artifactUrl.startsWith("..") && !artifactUrl.endsWith("/")) {
+                String pkgUrl = buildNexusUrl(subDir + "/" + artifactUrl);
+                workerService.submit(() -> {
+                    try {
+                        if(!existFile(pkgUrl)) {
+                            downloadFile(pkgUrl);
                             System.out.println("successfully downloaded: " + pkgUrl);
-                        } catch (Exception e) {
-                            System.out.println("failed to download: " + pkgUrl + " error: " + e.toString());
+                        } else {
+                            System.out.println("existed: " + pkgUrl);
                         }
-                    });
-                }
+                    } catch (Exception e) {
+                        System.out.println("failed to download: " + pkgUrl + " error: " + e.toString());
+                    }
+                });
             }
+        }
     }
 
     private static boolean existFile(String uri) throws Exception {
