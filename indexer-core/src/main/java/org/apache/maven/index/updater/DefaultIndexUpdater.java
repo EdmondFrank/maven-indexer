@@ -48,12 +48,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import org.apache.http.HttpEntity;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.client.methods.CloseableHttpResponse;
 
+import org.apache.http.util.EntityUtils;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
@@ -100,7 +106,9 @@ public class DefaultIndexUpdater
 
     private final List<IndexUpdateSideEffect> sideEffects;
 
-    private static String nexusHost = "http://mirrors.gitee.com/repository/maven-public";
+    private static String nexusUrl = "http://mirrors.gitee.com/repository/maven-central";
+
+    private static String centralUrl = "https://repo1.maven.org/maven2";
 
 
     @Inject
@@ -271,6 +279,25 @@ public class DefaultIndexUpdater
         }
     }
 
+    private static boolean existFile(String uri) throws Exception {
+        CloseableHttpClient httpclient = HttpClients.createDefault();
+        HttpHead head = new HttpHead(uri);
+        CloseableHttpResponse response = null;
+        try {
+            response = httpclient.execute(head);
+            if(response.getStatusLine().getStatusCode() == 200) {
+                return true;
+            } else {
+                return false;
+            }
+        } finally {
+            if (response != null) {
+                response.close();
+            }
+            httpclient.close();
+        }
+    }
+
     private static void downloadFile(String uri) throws Exception {
         CloseableHttpClient httpclient = HttpClients.createDefault();
         HttpGet httpGet = new HttpGet(uri);
@@ -284,8 +311,10 @@ public class DefaultIndexUpdater
                 switch (code) {
                 case 404:
                     System.out.println("[404] Not found failed to downloaded " + uri);
+                    break;
                 case 500:
                     System.out.println("[500] Server error failed to downloaded " + uri);
+                    break;
                 default:
                     System.out.println(String.format("[%d] Unknown error failed to downloaded ", code) + uri);
                 }
@@ -306,50 +335,136 @@ public class DefaultIndexUpdater
         try {
             final IndexReader directoryReader = DirectoryReader.open(directory);
             final int workers = 8;
+            final int fetchers = 3;
             final ThreadPoolExecutor executorService = new ThreadPoolExecutor(
-                                                                              workers,
-                                                                              workers,
-                                                                              0L,
-                                                                              TimeUnit.MILLISECONDS,
-                                                                              new ArrayBlockingQueue<Runnable>(workers),
-                                                                              new ThreadPoolExecutor.CallerRunsPolicy());
+                    fetchers,
+                    fetchers,
+                    0L,
+                    TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<Runnable>(fetchers),
+                    new ThreadPoolExecutor.CallerRunsPolicy());
+            final ThreadPoolExecutor workerService = new ThreadPoolExecutor(
+                    workers,
+                    workers,
+                    0L,
+                    TimeUnit.MICROSECONDS,
+                    new ArrayBlockingQueue<Runnable>(workers),
+                    new ThreadPoolExecutor.CallerRunsPolicy());
             try {
                 Bits liveDocs = MultiFields.getLiveDocs(directoryReader);
-                System.out.println("This updated docs nums:" + directoryReader.maxDoc());
+                final int updateTotal = directoryReader.maxDoc();
+                System.out.println("This updated docs nums:" + updateTotal);
+                ArtifactInfo prev = null;
                 for (int i = 0; i < directoryReader.maxDoc(); i++) {
                     if ( liveDocs == null || liveDocs.get( i ) ) {
                         final Document doc = directoryReader.document( i );
                         final ArtifactInfo ai = IndexUtils.constructArtifactInfo( doc, centralContext );
+                        if (prev != null &&
+                                prev.getGroupId().equals(ai.getGroupId()) &&
+                                prev.getArtifactId().equals(ai.getArtifactId()) &&
+                                prev.getVersion().equals((ai.getVersion()))) {
+                            continue;
+                        }
+                        final String artifactPath = '/' + ai.getGroupId().replace('.','/')
+                                + '/' + ai.getArtifactId()
+                                + '/' + ai.getVersion();
+                        final int index = i;
                         executorService.submit(new Callable<Boolean>() {
                             @Override
-                            public Boolean call() throws Exception {
+                            public Boolean call() {
                                 try {
-                                    String artifactUrl = nexusHost
-                                            + '/' + ai.getGroupId().replace('.','/')
-                                            + '/' + ai.getArtifactId()
-                                            + '/' + ai.getVersion()
-                                            + '/' + ai.getArtifactId()
-                                            + '-' + ai.getVersion()
-                                            + '.' + ai.getFileExtension();
-                                    downloadFile(artifactUrl);
+                                    fetchDir(index, updateTotal, artifactPath, workerService);
                                     return true;
                                 } catch (Exception e) {
-                                    System.out.println("failed to download:" + ai.getPath() + "\n" + e.toString());
+                                    System.out.println("failed to fetch:" + artifactPath + "\n" + e.toString());
                                     return false;
                                 }
                             }
                         });
+                        prev = ai;
                     }
                 }
             } finally {
                 directoryReader.close();
                 executorService.shutdown();
-                executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
+                executorService.awaitTermination(30L, TimeUnit.MINUTES);
+                workerService.shutdown();
+                workerService.awaitTermination(60L, TimeUnit.MINUTES);
             }
         } finally {
             centralContext.releaseIndexSearcher(s);
         }
 
+    }
+
+    private static void fetchDir(final int index, final int total,
+                                 final String subDir, ThreadPoolExecutor workerService) throws Exception {
+        String content = httpGetText(buildCentralUrl(subDir));
+        List<String> linkList = new ArrayList<String>();
+        final String linkRegex = "<a href=\"(.*?)\".*>(.*?)<\\/a>";
+        final Pattern linkPattern = Pattern.compile(linkRegex);
+        Matcher matcher = linkPattern.matcher(content);
+        while (matcher.find()) {
+            String href = matcher.group(1);
+            String title = matcher.group(2);
+            linkList.add(href);
+        }
+        for (final String artifactUrl : linkList) {
+            if (artifactUrl != null && !artifactUrl.startsWith("..") && !artifactUrl.endsWith("/")) {
+                final String pkgUrl = buildNexusUrl(subDir + "/" + artifactUrl);
+                workerService.submit(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        try {
+                            if (!existFile(pkgUrl)) {
+                                downloadFile(pkgUrl);
+                                System.out.println(String.format("[%d/%d] successfully downloaded: %s", index, total, pkgUrl));
+                            } else {
+                                System.out.println(String.format("[%d/%d] existed: %s", index, total, pkgUrl));
+                            }
+                            return true;
+                        } catch (Exception e) {
+                            System.out.println(String.format("[%d/%d] failed to download: %s error: %s", index, total, pkgUrl, e.toString()));
+                            return false;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    public static String httpGetText(String url) {
+        String result = "";
+        HttpGet request = buildRequest(url, 15);
+        try (CloseableHttpClient httpClient = HttpClients.createDefault();
+             CloseableHttpResponse response = httpClient.execute(request)) {
+            HttpEntity entity = response.getEntity();
+            if (entity != null) {
+                result = EntityUtils.toString(entity);
+            }
+        } finally {
+            return result;
+        }
+    }
+
+    private static HttpGet buildRequest(String url, int timeoutInSeconds) {
+        RequestConfig requestConfig;
+        RequestConfig.Builder builder = RequestConfig.custom()
+                .setConnectionRequestTimeout(timeoutInSeconds * 1000)
+                .setSocketTimeout(timeoutInSeconds * 1000);
+        requestConfig = builder.build();
+        HttpGet request = new HttpGet(url);
+        request.setConfig(requestConfig);
+        request.setHeader("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.106 Safari/537.36");
+        return request;
+    }
+
+    private static String buildCentralUrl(String relativePath) {
+        return String.format("%s%s", centralUrl, relativePath);
+    }
+
+    private static String buildNexusUrl(String relativePath) {
+        return String.format("%s%s", nexusUrl, relativePath);
     }
 
     private static void filterDirectory( final Directory directory, final DocumentFilter filter )
@@ -476,8 +591,8 @@ public class DefaultIndexUpdater
      * Unpack index data using specified Lucene Index writer
      * 
      * @param is an input stream to unpack index data from
-     * @param w a writer to save index data
-     * @param ics a collection of index creators for updating unpacked documents.
+     * @param d Directory for initialize indexWriter w
+     * @param context An Indexing context is a statefull component, it keeps state of index readers and writers.
      */
     public static IndexDataReadResult unpackIndexData( final InputStream is, final Directory d,
                                                        final IndexingContext context )

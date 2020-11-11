@@ -60,7 +60,6 @@ import org.codehaus.plexus.PlexusConstants;
 import org.codehaus.plexus.PlexusContainer;
 import org.codehaus.plexus.PlexusContainerException;
 import org.codehaus.plexus.component.repository.exception.ComponentLookupException;
-import org.eclipse.aether.version.InvalidVersionSpecificationException;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -133,7 +132,7 @@ public class BasicUsageExample
                     System.out.println("begin point : " + groupId + " " + artifactId);
                 }
             }
-            HashMap<String, String> options = new HashMap<String, String>();
+            HashMap<String, String> options = new HashMap<>();
             BasicUsageExample.centralUrl = indexUrl;
             BasicUsageExample.nexusUrl = nexusUrl;
             options.put("cache-dir", cacheDir);
@@ -175,7 +174,7 @@ public class BasicUsageExample
     }
 
     public void perform(HashMap<String, String> options)
-            throws IOException, ComponentLookupException, InvalidVersionSpecificationException, InterruptedException {
+            throws IOException, ComponentLookupException, InterruptedException {
         // Files where local cache is (if any) and Lucene Index should be located
         // String cacheDir, String indexDir, String indexUrl, String nexusUrl
         File centralLocalCache = new File(options.get("cache-dir"));
@@ -205,7 +204,6 @@ public class BasicUsageExample
         // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
        TransferListener listener = new AbstractTransferListener() {
                private int count = 0;
-               private int unitChunk = 64;
                private int col = 0;
                private int kb = 0;
 
@@ -214,6 +212,7 @@ public class BasicUsageExample
                }
 
                public void transferProgress(TransferEvent transferEvent, byte[] buffer, int length) {
+                   final int unitChunk = 64;
                    long totalLength = transferEvent.getResource().getContentLength();
                    if (buffer == null) {
                        return;
@@ -281,14 +280,14 @@ public class BasicUsageExample
                     BasicUsageExample.producers,
                     0L,
                     TimeUnit.MILLISECONDS,
-                    new ArrayBlockingQueue<Runnable>(BasicUsageExample.producers),
+                    new ArrayBlockingQueue<>(BasicUsageExample.producers),
                     new ThreadPoolExecutor.CallerRunsPolicy());
             final ThreadPoolExecutor workerService = new ThreadPoolExecutor(
                     BasicUsageExample.workers,
                     BasicUsageExample.workers,
                     0L,
                     TimeUnit.MICROSECONDS,
-                    new ArrayBlockingQueue<Runnable>(BasicUsageExample.workers),
+                    new ArrayBlockingQueue<>(BasicUsageExample.workers),
                     new ThreadPoolExecutor.CallerRunsPolicy());
             try
             {
@@ -312,7 +311,8 @@ public class BasicUsageExample
                 final IndexReader ir = searcher.getIndexReader();
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
                 ArtifactInfo prev = null;
-                for ( int i = ir.maxDoc() - 1; i >= 0; i--)
+                final int total = ir.maxDoc();
+                for ( int i = 0; i < ir.maxDoc(); i++)
                 {
                     if ( liveDocs == null || liveDocs.get( i ) )
                     {
@@ -341,9 +341,10 @@ public class BasicUsageExample
                             String artifactPath = '/' + ai.getGroupId().replace('.','/')
                                     + '/' + ai.getArtifactId()
                                     + '/' + ai.getVersion();
+                            final int index = i;
                             executorService.submit(() -> {
                                     try {
-                                        fetchDir(artifactPath, workerService);
+                                        fetchDir(index, total, artifactPath, workerService);
                                     } catch (Exception e) {
                                         System.out.println("failed to fetch:" + artifactPath + "\n" + e.toString());
                                     }
@@ -355,8 +356,8 @@ public class BasicUsageExample
             } finally {
                 centralContext.releaseIndexSearcher(searcher);
                 executorService.shutdown();
-                workerService.shutdown();
                 executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
+                workerService.shutdown();
                 workerService.awaitTermination(Long.MAX_VALUE, TimeUnit.MINUTES);
             }
         } else {
@@ -404,15 +405,14 @@ public class BasicUsageExample
         return options;
     }
 
-    private static void fetchDir(String subDir, ThreadPoolExecutor workerService) throws Exception {
+    private static void fetchDir (int index, int total, String subDir, ThreadPoolExecutor workerService) {
         String content = httpGetText(buildCentralUrl(subDir));
-        List<String> linkList = new ArrayList<String>();
+        List<String> linkList = new ArrayList<>();
         final String linkRegex = "<a href=\"(.*?)\".*>(.*?)<\\/a>";
         final Pattern linkPattern = Pattern.compile(linkRegex);
         Matcher matcher = linkPattern.matcher(content);
         while (matcher.find()) {
             String href = matcher.group(1);
-            String title = matcher.group(2);
             linkList.add(href);
         }
         for (String artifactUrl : linkList) {
@@ -422,12 +422,12 @@ public class BasicUsageExample
                     try {
                         if(!existFile(pkgUrl)) {
                             downloadFile(pkgUrl);
-                            System.out.println("successfully downloaded: " + pkgUrl);
+                            System.out.println(String.format("[%d/%d] successfully downloaded: %s", index, total, pkgUrl));
                         } else {
-                            System.out.println("existed: " + pkgUrl);
+                            System.out.println(String.format("[%d/%d] existed: %s", index, total, pkgUrl));
                         }
                     } catch (Exception e) {
-                        System.out.println("failed to download: " + pkgUrl + " error: " + e.toString());
+                        System.out.println(String.format("[%d/%d] failed to download: %s error: %s", index, total, pkgUrl, e.toString()));
                     }
                 });
             }
@@ -440,11 +440,7 @@ public class BasicUsageExample
         CloseableHttpResponse response = null;
         try {
             response = httpclient.execute(head);
-            if(response.getStatusLine().getStatusCode() == 200) {
-                return true;
-            } else {
-                return false;
-            }
+            return response.getStatusLine().getStatusCode() == 200;
         } finally {
             if (response != null) {
                 response.close();
