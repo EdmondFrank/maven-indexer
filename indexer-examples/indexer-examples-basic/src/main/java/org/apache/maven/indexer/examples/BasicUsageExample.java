@@ -59,6 +59,7 @@ import org.codehaus.plexus.DefaultPlexusContainer;
 import org.codehaus.plexus.PlexusConstants;
 import org.codehaus.plexus.PlexusContainer;
 import org.codehaus.plexus.PlexusContainerException;
+import org.codehaus.plexus.util.StringUtils;
 import org.codehaus.plexus.component.repository.exception.ComponentLookupException;
 
 import org.apache.commons.cli.CommandLine;
@@ -100,6 +101,7 @@ public class BasicUsageExample
             String nexusUrl = "http://mirrors.gitee.com/repository/maven-public";
             String groupId = "";
             String artifactId = "";
+            String lastIndex = "0";
             if (line.hasOption("index-url")) {
                 indexUrl = line.getOptionValue("index-url");
             }
@@ -124,12 +126,17 @@ public class BasicUsageExample
                 }
             }
             if (line.hasOption("last-sync")) {
+                String point = line.getOptionValue("last-sync");
 
-                String [] gav = line.getOptionValue("last-sync").split(",");
-                if (gav.length == 2) {
-                    groupId = gav[0];
-                    artifactId = gav[1];
-                    System.out.println("begin point : " + groupId + " " + artifactId);
+                if (StringUtils.isNumeric(point)) {
+                    lastIndex = point;
+                } else {
+                    String [] gav = line.getOptionValue("last-sync").split(",");
+                    if (gav.length == 2) {
+                        groupId = gav[0];
+                        artifactId = gav[1];
+                        System.out.println("begin point : " + groupId + " " + artifactId);
+                    }
                 }
             }
             HashMap<String, String> options = new HashMap<>();
@@ -139,6 +146,7 @@ public class BasicUsageExample
             options.put("index-dir", indexDir);
             options.put("last-group-id", groupId);
             options.put("last-artifact-id", artifactId);
+            options.put("last-index", lastIndex);
             options.put("only-stat", line.hasOption("stat") ? "1" : "0");
             basicUsageExample.perform(options);
         } else {
@@ -296,6 +304,7 @@ public class BasicUsageExample
                 boolean begin = false;
                 String lastGroupId = options.get("last-group-id");
                 String lastArtifactId = options.get("last-artifact-id");
+                int lastIndex = Integer.parseInt(options.get("last-index"), 10);
                 if (lastGroupId != "" && lastArtifactId != "") {
                     Query gidQ = indexer.constructQuery(MAVEN.GROUP_ID, new SourcedSearchExpression(lastGroupId));
                     Query aidQ = indexer.constructQuery( MAVEN.ARTIFACT_ID, new SourcedSearchExpression(lastArtifactId));
@@ -312,7 +321,7 @@ public class BasicUsageExample
                 Bits liveDocs = MultiFields.getLiveDocs( ir );
                 ArtifactInfo prev = null;
                 final int total = ir.maxDoc();
-                for ( int i = 0; i < ir.maxDoc(); i++)
+                for ( int i = lastIndex; i < ir.maxDoc(); i++)
                 {
                     if ( liveDocs == null || liveDocs.get( i ) )
                     {
