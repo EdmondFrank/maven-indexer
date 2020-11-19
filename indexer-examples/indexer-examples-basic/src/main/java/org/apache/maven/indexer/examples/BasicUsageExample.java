@@ -148,6 +148,8 @@ public class BasicUsageExample
             options.put("last-artifact-id", artifactId);
             options.put("last-index", lastIndex);
             options.put("only-stat", line.hasOption("stat") ? "1" : "0");
+            options.put("update-index", line.hasOption("update") ? "1" : "0");
+
             basicUsageExample.perform(options);
         } else {
             printHelp();
@@ -206,71 +208,73 @@ public class BasicUsageExample
         // other index sources might have different index publishing frequency.
         // Preferred frequency is once a week.
 
-        System.out.println( "Updating Index..." );
-        System.out.println( "This might take a while on first run, so please be patient!" );
-        // Create ResourceFetcher implementation to be used with IndexUpdateRequest
-        // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
-       TransferListener listener = new AbstractTransferListener() {
-               private int count = 0;
-               private int col = 0;
-               private int kb = 0;
+        if (options.get("update-index") == "1") {
+            System.out.println("Updating Index...");
+            System.out.println("This might take a while on first run, so please be patient!");
+            // Create ResourceFetcher implementation to be used with IndexUpdateRequest
+            // Here, we use Wagon based one as shorthand, but all we need is a ResourceFetcher implementation
+            TransferListener listener = new AbstractTransferListener() {
+                private int count = 0;
+                private int col = 0;
+                private int kb = 0;
 
-               public void transferStarted(TransferEvent transferEvent) {
-                   System.out.println("  Downloading " + transferEvent.getResource().getName());
-               }
+                public void transferStarted(TransferEvent transferEvent) {
+                    System.out.println("  Downloading " + transferEvent.getResource().getName());
+                }
 
-               public void transferProgress(TransferEvent transferEvent, byte[] buffer, int length) {
-                   final int unitChunk = 64;
-                   long totalLength = transferEvent.getResource().getContentLength();
-                   if (buffer == null) {
-                       return;
-                   }
+                public void transferProgress(TransferEvent transferEvent, byte[] buffer, int length) {
+                    final int unitChunk = 64;
+                    long totalLength = transferEvent.getResource().getContentLength();
+                    if (buffer == null) {
+                        return;
+                    }
 
-                   count += buffer.length;
+                    count += buffer.length;
 
-                   if ((count / unitChunk) > kb) {
-                       if (col > 80) {
-                           System.out.println(String.format("%s/%s", sizeFmt(count), sizeFmt(totalLength)));
-                           col = 0;
-                       }
+                    if ((count / unitChunk) > kb) {
+                        if (col > 80) {
+                            System.out.println(String.format("%s/%s", sizeFmt(count), sizeFmt(totalLength)));
+                            col = 0;
+                        }
 
-                       System.out.print('.');
-                       col++;
-                       kb++;
-                   }
-               }
+                        System.out.print('.');
+                        col++;
+                        kb++;
+                    }
+                }
 
-               public void transferCompleted(TransferEvent transferEvent) {
-                   System.out.println(" - Done");
-               }
-           };
+                public void transferCompleted(TransferEvent transferEvent) {
+                    System.out.println(" - Done");
+                }
+            };
 
-       ProxyInfo proxy = new ProxyInfo();
-       if (BasicUsageExample.globalProxy != "") {
-           try {
-               String[] ipInfo = BasicUsageExample.globalProxy.split(":");
-               proxy.setHost(ipInfo[0]);
-               proxy.setPort(Integer.parseInt(ipInfo[1], 10));
-               proxy.setType("HTTP");
-           } catch (Exception e) {
-               System.out.println("invaild proxy! correct format: host:<port>");
-               throw e;
-           }
-       }
-       ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher(httpWagon, listener, null, proxy);
-       Date centralContextCurrentTimestamp = centralContext.getTimestamp();
-       IndexUpdateRequest updateRequest = new IndexUpdateRequest(centralContext, resourceFetcher);
-       IndexUpdateResult updateResult = indexUpdater.fetchAndUpdateIndex(updateRequest);
+            ProxyInfo proxy = new ProxyInfo();
+            if (BasicUsageExample.globalProxy != "") {
+                try {
+                    String[] ipInfo = BasicUsageExample.globalProxy.split(":");
+                    proxy.setHost(ipInfo[0]);
+                    proxy.setPort(Integer.parseInt(ipInfo[1], 10));
+                    proxy.setType("HTTP");
+                } catch (Exception e) {
+                    System.out.println("invaild proxy! correct format: host:<port>");
+                    throw e;
+                }
+            }
+            ResourceFetcher resourceFetcher = new WagonHelper.WagonFetcher(httpWagon, listener, null, proxy);
+            Date centralContextCurrentTimestamp = centralContext.getTimestamp();
+            IndexUpdateRequest updateRequest = new IndexUpdateRequest(centralContext, resourceFetcher);
+            IndexUpdateResult updateResult = indexUpdater.fetchAndUpdateIndex(updateRequest);
 
-       if (updateResult.isFullUpdate()) {
-           System.out.println("Full update happened!");
-       } else if (updateResult.getTimestamp().equals(centralContextCurrentTimestamp)) {
-           System.out.println("No update needed, index is up to date!");
-       } else {
-           System.out.println(
-                              "Incremental update happened, change covered " + centralContextCurrentTimestamp + " - "
-                              + updateResult.getTimestamp() + " period.");
-       }
+            if (updateResult.isFullUpdate()) {
+                System.out.println("Full update happened!");
+            } else if (updateResult.getTimestamp().equals(centralContextCurrentTimestamp)) {
+                System.out.println("No update needed, index is up to date!");
+            } else {
+                System.out.println(
+                        "Incremental update happened, change covered " + centralContextCurrentTimestamp + " - "
+                                + updateResult.getTimestamp() + " period.");
+            }
+        }
         System.out.println( "Using index" );
         System.out.println( "===========" );
 
@@ -411,6 +415,7 @@ public class BasicUsageExample
         options.addOption("w", "workers", true,"set nums of download workers");
         options.addOption("p", "producers", true, "set nums of url fetchers");
         options.addOption("s", "stat", false, "only get artifacts statistics information");
+        options.addOption("U", "update", false, "update index if upstream allow");
         return options;
     }
 
